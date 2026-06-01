@@ -1,13 +1,40 @@
 import {
   detectServerTool,
   getLastUserText,
+  getToolHint,
+  runBookRestaurant,
   runSearchDestination,
   runHandleEmergency,
   runServerTool,
 } from '@/lib/agent-tools';
+import {
+  CAPABILITIES_REPLY,
+  isCapabilitiesQuestion,
+} from '@/lib/agent-capabilities';
+import {
+  AGENT_LIMITS,
+  buildAgentSystemPrompt,
+  getStreamSettings,
+  isClearlyOffTopic,
+  OFF_TOPIC_REPLY,
+  validateUserMessage,
+} from '@/lib/agent-policy';
+import { createPolicyStreamResponse } from '@/lib/fixed-reply';
+import {
+  buildTokenCostFromUsage,
+  logAgentError,
+  logAgentMetrics,
+  previewUserMessage,
+  type ContextLogSnapshot,
+} from '@/lib/logging';
 import { prepareConversationContext } from '@/lib/memory';
+import { createOllamaChatModel } from '@/lib/ollama-client';
+import {
+  DEFAULT_OLLAMA_MODEL,
+  modelSupportsNativeTools,
+  resolveModelId,
+} from '@/lib/ollama-config';
 import { toOllamaMessages } from '@/lib/ollama-messages';
-import { createOpenAI } from '@ai-sdk/openai';
 import {
   createUIMessageStream,
   createUIMessageStreamResponse,
@@ -19,156 +46,263 @@ import {
 } from 'ai';
 import { z } from 'zod';
 
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'qwen2:1.5b';
-const MODEL_SUPPORTS_TOOLS =
-  process.env.OLLAMA_SUPPORTS_TOOLS === 'true' ||
-  (!OLLAMA_MODEL.includes('1.5b') &&
-    process.env.OLLAMA_SUPPORTS_TOOLS !== 'false');
-
-const ollama = createOpenAI({
-  baseURL: 'http://localhost:11434/v1',
-  apiKey: 'ollama',
-});
-
-const ollamaModel = ollama.chat(OLLAMA_MODEL);
-
-const BASE_SYSTEM_PROMPT = `Bạn là trợ lý ảo AI túc trực tại VinWonders.
-Hỗ trợ: tìm trò chơi, nhà hàng, show, khách sạn; xử lý mất đồ / y tế khẩn cấp.
-Luôn trả lời thân thiện, ngắn gọn, tiếng Việt.`;
-
-const agentTools = {
-  searchDestination: tool({
-    description:
-      'Tìm trò chơi, nhà hàng, show, khách sạn, liên hệ trong VinWonders.',
-    inputSchema: z.object({
-      keyword: z.string().describe('Từ khóa cần tìm'),
-      category: z
-        .enum(['ride', 'restaurant', 'facility', 'hotel', 'show', 'contact'])
-        .optional()
-        .describe('Lọc theo loại địa điểm'),
+function buildAgentTools() {
+  return {
+    searchDestination: tool({
+      description:
+        'Tìm trò chơi, nhà hàng, show, khách sạn, liên hệ trong VinWonders.',
+      inputSchema: z.object({
+        keyword: z.string().describe('Từ khóa cần tìm'),
+        category: z
+          .enum(['ride', 'restaurant', 'facility', 'hotel', 'show', 'contact'])
+          .optional()
+          .describe('Lọc theo loại địa điểm'),
+      }),
+      execute: async ({ keyword, category }) =>
+        runSearchDestination(keyword, category),
     }),
-    execute: async ({ keyword, category }) =>
-      runSearchDestination(keyword, category),
-  }),
-  handleEmergency: tool({
-    description: 'Xử lý mất đồ, lạc trẻ em, sự cố y tế khẩn cấp.',
-    inputSchema: z.object({
-      type: z.enum(['lost_item', 'medical', 'other']),
-      description: z.string(),
+    bookRestaurant: tool({
+      description:
+        'Đặt bàn nhà hàng tại VinWonders. Dùng khi khách muốn giữ chỗ, đặt bàn, reserve.',
+      inputSchema: z.object({
+        restaurantId: z.string().optional(),
+        restaurantName: z.string().optional(),
+        guestName: z.string().optional(),
+        partySize: z.number().optional(),
+        dateTime: z.string().optional(),
+        notes: z.string().optional(),
+      }),
+      execute: async (input) => runBookRestaurant(input, [], ''),
     }),
-    execute: async ({ type, description }) =>
-      runHandleEmergency(type, description),
-  }),
-};
-
-function buildSystemPrompt(memorySummary: string, contextNote: string): string {
-  const blocks = [BASE_SYSTEM_PROMPT];
-  if (memorySummary) blocks.push(memorySummary);
-  if (contextNote) blocks.push(contextNote);
-  return blocks.join('\n\n');
+    handleEmergency: tool({
+      description: 'Xử lý mất đồ, lạc trẻ em, sự cố y tế khẩn cấp.',
+      inputSchema: z.object({
+        type: z.enum(['lost_item', 'medical', 'other']),
+        description: z.string(),
+      }),
+      execute: async ({ type, description }) =>
+        runHandleEmergency(type, description),
+    }),
+  };
 }
 
-function logMetrics(usage: LanguageModelUsage, startTime: number) {
-  const latencyMs = (performance.now() - startTime).toFixed(2);
-  const inputTokens = usage.inputTokens ?? 0;
-  const outputTokens = usage.outputTokens ?? 0;
-  const totalTokens = usage.totalTokens ?? 0;
+function toContextSnapshot(
+  ctx: ReturnType<typeof prepareConversationContext>,
+): ContextLogSnapshot {
+  return {
+    totalUiMessages: ctx.stats.totalUiMessages,
+    windowUiMessages: ctx.stats.windowUiMessages,
+    prunedUiMessages: ctx.stats.prunedUiMessages,
+    estimatedContextTokens: ctx.stats.estimatedTokens,
+    memoryActive: Boolean(ctx.memorySummary),
+  };
+}
 
-  console.log('\n====== [AI AGENT METRICS LOG] ======');
-  console.log(`⏱️ Latency: ${latencyMs} ms`);
-  console.log(`📥 Input Tokens: ${inputTokens}`);
-  console.log(`📤 Output Tokens: ${outputTokens}`);
-  console.log(`🔤 Total Tokens: ${totalTokens}`);
-  console.log('====================================\n');
+type RequestMeta = {
+  requestId: string;
+  startTime: number;
+  userPreview: string;
+  context: ContextLogSnapshot;
+  toolUsed: string | null;
+  modelId: string;
+};
+
+function createOnFinish(meta: RequestMeta) {
+  return async ({
+    usage,
+    finishReason,
+  }: {
+    usage: LanguageModelUsage;
+    finishReason?: string;
+  }) => {
+    await logAgentMetrics({
+      requestId: meta.requestId,
+      model: meta.modelId,
+      toolUsed: meta.toolUsed,
+      finishReason,
+      latencyMs: Math.round(performance.now() - meta.startTime),
+      tokens: buildTokenCostFromUsage(
+        usage.inputTokens ?? 0,
+        usage.outputTokens ?? 0,
+        meta.modelId,
+      ),
+      context: meta.context,
+      userMessagePreview: meta.userPreview,
+    });
+  };
+}
+
+async function logPolicyReply(meta: RequestMeta, replyLength: number) {
+  await logAgentMetrics({
+    requestId: meta.requestId,
+    model: meta.modelId,
+    toolUsed: meta.toolUsed,
+    finishReason: 'policy',
+    latencyMs: Math.round(performance.now() - meta.startTime),
+    tokens: buildTokenCostFromUsage(
+      0,
+      Math.ceil(replyLength / 4),
+      meta.modelId,
+    ),
+    context: meta.context,
+    userMessagePreview: meta.userPreview,
+  });
 }
 
 export async function POST(req: Request) {
-  const { messages }: { messages: UIMessage[] } = await req.json();
+  const requestId = generateId();
   const startTime = performance.now();
+
+  let messages: UIMessage[];
+  let modelId = DEFAULT_OLLAMA_MODEL;
+
+  try {
+    const body = await req.json();
+    messages = body.messages;
+    modelId = resolveModelId(body.model);
+  } catch (error) {
+    await logAgentError({
+      requestId,
+      model: modelId,
+      latencyMs: Math.round(performance.now() - startTime),
+      message: error instanceof Error ? error.message : 'Invalid JSON body',
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    return Response.json({ error: 'Yêu cầu không hợp lệ.' }, { status: 400 });
+  }
+
+  const useNativeTools = modelSupportsNativeTools(modelId);
+  const chatModel = createOllamaChatModel(modelId);
 
   const ctx = prepareConversationContext(messages);
   const modelMessages = toOllamaMessages(ctx.windowMessages);
+  const system = buildAgentSystemPrompt(ctx.memorySummary);
+  const lastUserText = getLastUserText(messages);
+  const userPreview = previewUserMessage(lastUserText);
+  const contextSnapshot = toContextSnapshot(ctx);
 
-  const contextNote =
-    ctx.stats.prunedUiMessages > 0
-      ? `[Context window] Đang gửi ${ctx.stats.windowUiMessages}/${ctx.stats.totalUiMessages} tin gần nhất (~${ctx.stats.estimatedTokens} tokens ước lượng).`
-      : '';
-
-  const system = buildSystemPrompt(ctx.memorySummary, contextNote);
-
-  const onFinish = ({ usage }: { usage: LanguageModelUsage }) =>
-    logMetrics(usage, startTime);
-
-  const responseHeaders = {
-    'X-Context-Total': String(ctx.stats.totalUiMessages),
-    'X-Context-Window': String(ctx.stats.windowUiMessages),
-    'X-Context-Pruned': String(ctx.stats.prunedUiMessages),
-    'X-Context-Tokens': String(ctx.stats.estimatedTokens),
-    'X-Memory-Active': ctx.memorySummary ? '1' : '0',
+  const baseMeta: RequestMeta = {
+    requestId,
+    startTime,
+    userPreview,
+    context: contextSnapshot,
+    toolUsed: null,
+    modelId,
   };
 
-  if (!MODEL_SUPPORTS_TOOLS) {
-    const serverTool = detectServerTool(getLastUserText(messages));
+  const inputCheck = validateUserMessage(lastUserText);
+  if (!inputCheck.ok) {
+    const meta = { ...baseMeta, toolUsed: `policy_${inputCheck.reason}` };
+    await logPolicyReply(meta, inputCheck.message.length);
+    return createPolicyStreamResponse(messages, inputCheck.message);
+  }
 
-    if (serverTool) {
-      const { name, input, output } = await runServerTool(serverTool);
-      const toolCallId = generateId();
+  if (isCapabilitiesQuestion(lastUserText)) {
+    const meta = { ...baseMeta, toolUsed: 'policy_capabilities' };
+    await logPolicyReply(meta, CAPABILITIES_REPLY.length);
+    return createPolicyStreamResponse(messages, CAPABILITIES_REPLY);
+  }
 
-      const streamResponse = createUIMessageStreamResponse({
-        stream: createUIMessageStream({
-          originalMessages: messages,
-          execute: async ({ writer }) => {
-            writer.write({
-              type: 'tool-input-available',
-              toolCallId,
-              toolName: name,
-              input,
-            });
-            writer.write({
-              type: 'tool-output-available',
-              toolCallId,
-              output,
-            });
+  if (isClearlyOffTopic(lastUserText)) {
+    const meta = { ...baseMeta, toolUsed: 'policy_off_topic' };
+    await logPolicyReply(meta, OFF_TOPIC_REPLY.length);
+    return createPolicyStreamResponse(messages, OFF_TOPIC_REPLY);
+  }
 
-            const toolHint =
-              name === 'searchDestination'
-                ? 'Khách đang hỏi gợi ý địa điểm — KHÔNG tạo ticket khẩn cấp mới; chỉ gợi ý chỗ chơi/ăn phù hợp.'
-                : 'Tóm tắt kết quả khẩn cấp cho khách.';
+  try {
+    if (!useNativeTools) {
+      const serverTool = detectServerTool(lastUserText, messages);
 
-            const summary = streamText({
-              model: ollamaModel,
-              messages: modelMessages,
-              system: `${system}\n\n${toolHint}\n\nKết quả công cụ "${name}": ${JSON.stringify(output)}.`,
-              onFinish,
-            });
-            writer.merge(summary.toUIMessageStream());
-          },
-        }),
-        headers: responseHeaders,
+      if (serverTool) {
+        const meta: RequestMeta = {
+          ...baseMeta,
+          toolUsed: serverTool.name,
+        };
+        const { name, input, output } = await runServerTool(
+          serverTool,
+          messages,
+          lastUserText,
+        );
+        const toolCallId = generateId();
+        const toolHint = getToolHint(name);
+
+        return createUIMessageStreamResponse({
+          stream: createUIMessageStream({
+            originalMessages: messages,
+            execute: async ({ writer }) => {
+              writer.write({
+                type: 'tool-input-available',
+                toolCallId,
+                toolName: name,
+                input,
+              });
+              writer.write({
+                type: 'tool-output-available',
+                toolCallId,
+                output,
+              });
+
+              const summary = streamText({
+                model: chatModel,
+                messages: modelMessages,
+                system: `${system}\n\n${toolHint}\n\nKết quả công cụ "${name}": ${JSON.stringify(output)}. Tóm tắt tối đa ${AGENT_LIMITS.maxSentencesHint} câu, không bịa thêm.`,
+                ...getStreamSettings({ afterTool: true }),
+                onFinish: createOnFinish(meta),
+              });
+              for await (const chunk of summary.toUIMessageStream({
+                sendStart: false,
+                sendFinish: false,
+              })) {
+                if (
+                  chunk.type === 'text-start' ||
+                  chunk.type === 'text-delta' ||
+                  chunk.type === 'text-end'
+                ) {
+                  writer.write(chunk);
+                }
+              }
+            },
+          }),
+        });
+      }
+
+      const result = streamText({
+        model: chatModel,
+        messages: modelMessages,
+        system,
+        ...getStreamSettings(),
+        onFinish: createOnFinish(baseMeta),
       });
 
-      return streamResponse;
+      return result.toUIMessageStreamResponse();
     }
 
     const result = streamText({
-      model: ollamaModel,
+      model: chatModel,
       messages: modelMessages,
-      system,
-      onFinish,
+      system: `${system}
+Khi cần: searchDestination (địa điểm), bookRestaurant (đặt bàn), handleEmergency (khẩn cấp).`,
+      tools: buildAgentTools(),
+      ...getStreamSettings(),
+      onFinish: createOnFinish(baseMeta),
     });
 
-    return result.toUIMessageStreamResponse({ headers: responseHeaders });
+    return result.toUIMessageStreamResponse();
+  } catch (error) {
+    await logAgentError({
+      requestId,
+      model: modelId,
+      latencyMs: Math.round(performance.now() - startTime),
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      context: contextSnapshot,
+      userMessagePreview: userPreview,
+    });
+
+    return Response.json(
+      { error: 'Không thể xử lý yêu cầu. Vui lòng thử lại sau.' },
+      { status: 500 },
+    );
   }
-
-  const result = streamText({
-    model: ollamaModel,
-    messages: modelMessages,
-    system: `${system}
-Nếu khách hỏi địa điểm → gọi searchDestination.
-Nếu khách báo mất đồ / y tế khẩn cấp → gọi handleEmergency.`,
-    tools: agentTools,
-    onFinish,
-  });
-
-  return result.toUIMessageStreamResponse({ headers: responseHeaders });
 }
+

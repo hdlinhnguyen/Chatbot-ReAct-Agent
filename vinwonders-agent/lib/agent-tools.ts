@@ -1,5 +1,7 @@
 import type { UIMessage } from 'ai';
+import { isClearlyOffTopic } from './agent-policy';
 import type { Destination } from './mockData';
+import { runBookRestaurant } from './booking';
 import {
   extractSearchKeyword,
   findContactByPurpose,
@@ -42,6 +44,8 @@ export async function runHandleEmergency(
   };
 }
 
+export { runBookRestaurant };
+
 export function getLastUserText(messages: UIMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
@@ -63,38 +67,76 @@ export type ServerTool =
   | {
       name: 'handleEmergency';
       input: { type: 'lost_item' | 'medical' | 'other'; description: string };
+    }
+  | {
+      name: 'bookRestaurant';
+      input: {
+        restaurantId?: string;
+        restaurantName?: string;
+        guestName?: string;
+        partySize?: number;
+        dateTime?: string;
+        notes?: string;
+      };
     };
 
-/** Ý định hỏi gợi ý / khám phá — ưu tiên trước emergency để tránh false positive */
+const BOOKING_INTENT =
+  /(đặt bàn|dat ban|đặt chỗ|dat cho|giữ bàn|giu ban|giữ chỗ|giu cho|đặt hộ|dat ho|book\s*table|reserve|reservation|booking)/i;
+
 const EXPLORATION_INTENT =
   /(đề xuất|de xuat|gợi ý|goi y|nên đi|nen di|chơi đâu|choi dau|đi đâu|di dau|chỗ nào|cho nao|khám phá|kham pha|tìm chỗ|tim cho|giới thiệu|gioi thieu|nên chơi|nen choi|muốn đi|muon di|đi chơi|di choi|chỗ vui|cho vui|lịch trình|lich trinh|địa điểm nào|dia diem nao)/i;
 
 const EMERGENCY_MEDICAL =
   /(y tế|yte|medical|say nắng|say nang|chóng mặt|chong mat|cấp cứu|cap cuu|bị thương|bi thuong|không khỏe|khong khoe)/i;
 
-/** Chỉ báo cáo sự cố rõ ràng — không dùng pattern mơ hồ như vi\b hay roi */
 const EMERGENCY_INCIDENT =
   /(khẩn cấp|khan cap|bị cướp|bi cuop|mất đồ|mat do|mất ví|mat vi|mất điện thoại|mat dien thoai|mất phone|mat phone|lost my|thất lạc đồ|that lac do|lạc trẻ|lac tre|giúp gấp|giup gap|bị mất|bi mat|vừa mất|vua mat|bị rơi|bi roi|đánh mất|danh mat)/i;
 
+/** Không dùng `an\\b` — dễ khớp nhầm đuôi từ (vd. iran). */
 const SEARCH_FALLBACK =
-  /(mưa|mua|rain|tìm|tim|nhà hàng|nha hang|khách sạn|khach san|show|safari|zeus|buffet|ăn|an\b|đói|doi\b|hotel|resort)/i;
+  /(mưa|mua|rain|tìm|tim|nhà hàng|nha hang|khách sạn|khach san|show|safari|zeus|buffet|đói|doi\b|hotel|resort|vinwonders|công viên|cong vien)/i;
 
 const SORRY_FALLBACK =
 /(xin lỗi|sorry|bị lỗi|bi loi|không biết| không thể|khong biet|chưa rõ|chua ro|không chắc|khong chac)/i;
 
 export function detectServerTool(text: string): ServerTool | null {
+function parseBookInput(
+  text: string,
+): Extract<ServerTool, { name: 'bookRestaurant' }>['input'] | null {
+  if (!BOOKING_INTENT.test(text)) return null;
+  const partyMatch = text.match(/(\d+)\s*(người|nguoi|khách|khach)/i);
+  const timeMatch = text.match(/(\d{1,2})[:h](\d{2})?/i);
+  const nameMatch = text.match(
+    /(?:tên|ten|tôi là|toi la)\s+([A-Za-zÀ-ỹ\s]{2,24})/i,
+  );
+  return {
+    restaurantName: text,
+    partySize: partyMatch ? Number(partyMatch[1]) : undefined,
+    dateTime: timeMatch
+      ? `Hôm nay, ${timeMatch[1].padStart(2, '0')}:${(timeMatch[2] ?? '00').padStart(2, '0')}`
+      : undefined,
+    guestName: nameMatch?.[1]?.trim(),
+    notes: text,
+  };
+}
+
+export function detectServerTool(
+  text: string,
+  messages: UIMessage[] = [],
+): ServerTool | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
 
+  if (isClearlyOffTopic(trimmed)) return null;
+
   const lower = trimmed.toLowerCase();
 
-  // 1) Câu hỏi gợi ý / đi chơi → search (kể cả sau khi đã báo mất đồ trước đó)
-  if (EXPLORATION_INTENT.test(lower) && !SORRY_FALLBACK.test(lower)) {
-    const { keyword, category } = extractSearchKeyword(trimmed);
-    return {
-      name: 'searchDestination',
-      input: { keyword, category },
-    };
+  // 1) Đặt bàn — ưu tiên cao (kể cả sau khi vừa gợi ý nhà hàng)
+  if (BOOKING_INTENT.test(lower)) {
+    const input = parseBookInput(trimmed);
+    if (input) {
+      return { name: 'bookRestaurant', input };
+    }
   }
 
   // 2) Y tế khẩn cấp
@@ -105,16 +147,25 @@ export function detectServerTool(text: string): ServerTool | null {
     };
   }
 
-  // 3) Báo sự cố mất đồ / an ninh
-  if (EMERGENCY_INCIDENT.test(lower) && !SORRY_FALLBACK.test(lower)) {
+  // 3) Báo sự cố
+  if (EMERGENCY_INCIDENT.test(lower)) {
     return {
       name: 'handleEmergency',
       input: { type: 'lost_item', description: trimmed },
     };
   }
 
-  // 4) Tìm kiếm địa điểm chung
-  if (SEARCH_FALLBACK.test(lower) && !SORRY_FALLBACK.test(lower)) {
+  // 4) Gợi ý / khám phá
+  if (EXPLORATION_INTENT.test(lower)) {
+    const { keyword, category } = extractSearchKeyword(trimmed);
+    return {
+      name: 'searchDestination',
+      input: { keyword, category },
+    };
+  }
+
+  // 5) Tìm kiếm chung
+  if (SEARCH_FALLBACK.test(lower)) {
     const { keyword, category } = extractSearchKeyword(trimmed);
     return {
       name: 'searchDestination',
@@ -125,7 +176,11 @@ export function detectServerTool(text: string): ServerTool | null {
   return null;
 }
 
-export async function runServerTool(serverTool: ServerTool) {
+export async function runServerTool(
+  serverTool: ServerTool,
+  messages: UIMessage[] = [],
+  userText = '',
+) {
   if (serverTool.name === 'searchDestination') {
     return {
       name: serverTool.name,
@@ -136,6 +191,15 @@ export async function runServerTool(serverTool: ServerTool) {
       ),
     };
   }
+
+  if (serverTool.name === 'bookRestaurant') {
+    return {
+      name: serverTool.name,
+      input: serverTool.input,
+      output: await runBookRestaurant(serverTool.input, messages, userText),
+    };
+  }
+
   return {
     name: serverTool.name,
     input: serverTool.input,
@@ -145,3 +209,18 @@ export async function runServerTool(serverTool: ServerTool) {
     ),
   };
 }
+
+function getToolHint(toolName: string): string {
+  switch (toolName) {
+    case 'searchDestination':
+      return 'Khách đang hỏi gợi ý địa điểm. Gợi ý ngắn; nếu là nhà hàng, nhắc có thể đặt bàn qua agent.';
+    case 'bookRestaurant':
+      return 'Đã đặt bàn xong. Xác nhận mã booking, giờ đến, số người; không tạo ticket khẩn cấp.';
+    case 'handleEmergency':
+      return 'Tóm tắt kết quả khẩn cấp cho khách.';
+    default:
+      return 'Tóm tắt ngắn cho khách.';
+  }
+}
+
+export { getToolHint };
