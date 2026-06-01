@@ -32,7 +32,7 @@ Tiến hóa theo [`tooldoc.md`](../../tooldoc.md): **v1.0** (text Q&A) → **v2.
 |------------|-----------|
 | Hoàng Đức Trường | End-to-end VinWonders: API chat, 3 tools, policy, logging, Agent Trace UI, debug Ollama/AI SDK |
 | Nguyễn Hồ Diệu Linh | v2.1 guardrails: `tool-guard`, spam silent, `stepCountIs`, Karpathy rules, sửa `agent-tools.ts` |
-
+| Trần Hoàng Hà | maintainer, Successful implementation of the ReAct loop (2+ tools), Documentation of both successful and failed traces, Security (Guardrails) |
 ---
 
 ## 2. System Architecture & Tooling
